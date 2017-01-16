@@ -16,15 +16,15 @@
 import logging
 import os
 import threading
-
-from clint.textui import puts, puts_err, colored, columns
-
 import argparse
 import errno
 import json
 import sys
 import traceback
 import yaml
+import signal
+
+from clint.textui import puts, puts_err, colored, columns
 
 from .api import rest
 from .chaos import BlockadeChaos
@@ -35,6 +35,7 @@ from .errors import InsufficientPermissionsError
 from .net import BlockadeNetwork
 from .state import BlockadeState
 from .utils import check_docker
+from .host import HostExec
 
 
 def load_config(config_file=None):
@@ -73,7 +74,20 @@ def get_blockade(config, opts):
     return Blockade(config,
                     blockade_id=blockade_id,
                     state=state,
-                    network=BlockadeNetwork(config))
+                    network=BlockadeNetwork(config, get_host_exec()))
+
+
+_host_exec = None
+
+
+def get_host_exec():
+    global _host_exec
+    if _host_exec is not None:
+        return _host_exec
+
+    host_exec = HostExec()
+    _host_exec = host_exec
+    return host_exec
 
 
 def print_containers(containers, to_json=False):
@@ -193,8 +207,8 @@ def cmd_start(opts):
 def cmd_kill(opts):
     """Kill some or all containers
     """
-    signal = opts.signal if hasattr(opts, 'signal') else "SIGKILL"
-    __with_containers(opts, Blockade.kill, signal=signal)
+    kill_signal = opts.signal if hasattr(opts, 'signal') else "SIGKILL"
+    __with_containers(opts, Blockade.kill, signal=kill_signal)
 
 
 def cmd_stop(opts):
@@ -344,7 +358,8 @@ def cmd_daemon(opts):
     """
     if opts.data_dir is None:
         raise BlockadeError("You must supply a data directory for the daemon")
-    rest.start(data_dir=opts.data_dir, port=opts.port, debug=opts.debug)
+    rest.start(data_dir=opts.data_dir, port=opts.port, debug=opts.debug,
+        host_exec=get_host_exec())
 
 
 def cmd_add(opts):
@@ -563,6 +578,15 @@ def _setup_logging(opts):
         logging.config.dictConfig(config)
 
 
+def run_cleanups():
+    try:
+        get_host_exec().close()
+    except:
+        puts_err(
+            colored.red("\nUnexpected error in cleanup! This may be a Blockade bug.\n"))
+        traceback.print_exc()
+
+
 def main(args=None):
     if sys.version_info >= (3, 2) and sys.version_info < (3, 3):
         puts_err(colored.red("\nFor Python 3, Flask requires Python >= 3.3\n"))
@@ -571,6 +595,14 @@ def main(args=None):
     parser = setup_parser()
     opts = parser.parse_args(args=args)
     _setup_logging(opts)
+
+    # register a signal handler to run cleanups in response to SIGTERM.
+    # note that SIGINT in handled below in the normal flow of the try/except
+    # block.
+    def _signal_handler(*args):
+        run_cleanups()
+        sys.exit()
+    signal.signal(signal.SIGTERM, _signal_handler)
 
     rc = 0
 
@@ -583,7 +615,7 @@ def main(args=None):
         opts.func(opts)
     except InsufficientPermissionsError as e:
         puts_err(colored.red(
-                "\nInsufficient permissions error:\n") + str(e) + "\n")
+                 "\nInsufficient permissions error:\n") + str(e) + "\n")
         rc = 1
     except BlockadeError as e:
         puts_err(colored.red("\nError:\n") + str(e) + "\n")
@@ -597,6 +629,9 @@ def main(args=None):
             colored.red("\nUnexpected error! This may be a Blockade bug.\n"))
         traceback.print_exc()
         rc = 2
+
+    finally:
+        run_cleanups()
 
     sys.exit(rc)
 
